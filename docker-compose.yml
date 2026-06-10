@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: legal-agent-postgres
+    environment:
+      POSTGRES_DB: legal_agent
+      POSTGRES_USER: legal_agent
+      POSTGRES_PASSWORD: legal_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - legal_agent_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U legal_agent -d legal_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  legal_agent_pgdata:
