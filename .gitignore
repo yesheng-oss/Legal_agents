@@ -1,0 +1,11 @@
+data/
+hf_data/
+.pytest_cache/
+.venv/
+__pycache__/
+*.pyc
+*.log
+uvicorn-*.log
+.env
+.DS_Store
+page-script-check.js
