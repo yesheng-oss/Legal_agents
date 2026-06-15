@@ -1,10 +1,16 @@
-import json, time
+import json
+import time
 from pathlib import Path
-import chromadb
-from sentence_transformers import SentenceTransformer
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from config import EMBEDDING_MODEL, CHUNK_SIZE, CHUNK_OVERLAP, CHROMA_PERSIST_DIR, RAW_DATA_DIR
+from sentence_transformers import SentenceTransformer
+from sqlalchemy import text
+
+from config import CHUNK_SIZE, CHUNK_OVERLAP, EMBEDDING_MODEL, RAW_DATA_DIR
+from db import create_session_factory, init_db, session_scope
+from models import Base, LegalDocument
+
 
 def load_data(filepath, limit=None):
     docs = []
@@ -38,6 +44,7 @@ def load_data(filepath, limit=None):
             docs.append(Document(
                 page_content=text,
                 metadata={
+                    "source_case_id": f"case-{i + 1}",
                     "accusations": accusations,
                     "articles": str(articles),
                     "punishment": punishment.get("imprisonment", 0),
@@ -45,19 +52,30 @@ def load_data(filepath, limit=None):
             ))
     return docs
 
+
 def ingest():
-    persist = Path(CHROMA_PERSIST_DIR)
-    if persist.exists() and any(persist.iterdir()):
-        print("Chroma index already exists, skipping ingestion")
-        return
+    session_factory = create_session_factory()
+    init_db(Base.metadata, session_factory)
+
+    with session_scope(session_factory) as session:
+        count = session.execute(text("SELECT COUNT(*) FROM legal_documents")).scalar()
+        if count and count > 0:
+            print(f"PostgreSQL 中已有 {count} 条法律文档，跳过导入")
+            return
 
     train_path = Path(RAW_DATA_DIR) / "train.json"
     if not train_path.exists():
         print("Data not found, run download.py first")
         return
 
-    print("Loading data (first 1000 records)...")
-    docs = load_data(str(train_path), limit=1000)
+    import os
+    limit_env = os.environ.get("INGEST_LIMIT")
+    limit = int(limit_env) if limit_env else None
+    if limit:
+        print(f"Loading data (limit={limit} records)...")
+    else:
+        print("Loading all data...")
+    docs = load_data(str(train_path), limit=limit)
     print(f"Loaded {len(docs)} documents")
 
     splitter = RecursiveCharacterTextSplitter(
@@ -70,35 +88,47 @@ def ingest():
     print(f"Split into {len(chunks)} chunks")
 
     print("Loading embedding model...")
-    model = SentenceTransformer(EMBEDDING_MODEL)
+    embed_model = SentenceTransformer(EMBEDDING_MODEL)
+
+    source_counts: dict[str, int] = {}
+    for chunk in chunks:
+        source_case_id = chunk.metadata.get("source_case_id", "")
+        chunk.metadata["source_chunk_index"] = source_counts.get(source_case_id, 0)
+        source_counts[source_case_id] = source_counts.get(source_case_id, 0) + 1
 
     texts = [d.page_content for d in chunks]
     metas = [d.metadata for d in chunks]
     del chunks
 
     BATCH = 128
-    client = chromadb.PersistentClient(path=str(persist))
-    collection = client.get_or_create_collection(name="legal_docs")
-
     total = len(texts)
     print(f"Starting embedding loop ({total} texts, batch={BATCH})...", flush=True)
-    for i in range(0, total, BATCH):
-        batch_texts = texts[i:i+BATCH]
-        batch_metas = metas[i:i+BATCH]
-        t0 = time.time()
-        embeddings = model.encode(batch_texts, show_progress_bar=False).tolist()
-        t1 = time.time()
-        ids = [f"doc_{i+j}" for j in range(len(batch_texts))]
-        collection.add(
-            embeddings=embeddings,
-            documents=batch_texts,
-            metadatas=batch_metas,
-            ids=ids,
-        )
-        t2 = time.time()
-        print(f"  [{min(i+BATCH, total)}/{total}] encode:{t1-t0:.1f}s db:{t2-t1:.1f}s")
 
-    print(f"Index saved to {CHROMA_PERSIST_DIR}")
+    session_factory = create_session_factory()
+    with session_scope(session_factory) as session:
+        for i in range(0, total, BATCH):
+            batch_texts = texts[i:i + BATCH]
+            batch_metas = metas[i:i + BATCH]
+            t0 = time.time()
+            embeddings = embed_model.encode(batch_texts, show_progress_bar=False).tolist()
+            t1 = time.time()
+
+            for chunk_text, meta, emb in zip(batch_texts, batch_metas, embeddings):
+                session.add(LegalDocument(
+                    content=chunk_text,
+                    accusations=meta.get("accusations", ""),
+                    articles=meta.get("articles", ""),
+                    punishment=meta.get("punishment", 0),
+                    source_case_id=meta.get("source_case_id", ""),
+                    source_chunk_index=meta.get("source_chunk_index", 0),
+                    embedding=emb,
+                ))
+            session.flush()
+            t2 = time.time()
+            print(f"  [{min(i + BATCH, total)}/{total}] encode:{t1 - t0:.1f}s db:{t2 - t1:.1f}s")
+
+    print(f"Ingested {total} documents into PostgreSQL")
+
 
 if __name__ == "__main__":
     ingest()

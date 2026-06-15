@@ -48,6 +48,65 @@ class ConversationService:
                 "memory": self.memory_service.to_dict(updated_memory),
             }
 
+    def chat_stream_events(self, question, conversation_id=None, case_id=None):
+        with session_scope(self.session_factory) as session:
+            case, conversation = self._resolve_case_and_conversation(session, question, conversation_id, case_id)
+            history = self._recent_history(session, conversation.id)
+            memory = self.memory_service.get_or_create(session, case.id)
+            answer_parts = []
+            references = []
+            final_steps = []
+            final_intent = "legal_qa"
+            final_confidence = "unknown"
+
+            for event_name, payload in self.agent.stream_chat_events(
+                question,
+                history=history,
+                memory=self.memory_service.to_dict(memory),
+            ):
+                if event_name == "meta":
+                    payload = {
+                        **payload,
+                        "case_id": case.id,
+                        "conversation_id": conversation.id,
+                    }
+                    final_intent = payload.get("intent", final_intent)
+                    final_confidence = payload.get("confidence", final_confidence)
+                elif event_name == "delta":
+                    answer_parts.append(payload.get("text", ""))
+                elif event_name == "references":
+                    references = payload.get("references", [])
+                elif event_name == "steps":
+                    final_steps = payload.get("steps", [])
+                elif event_name == "done":
+                    continue
+                yield event_name, payload
+
+            answer = "".join(answer_parts)
+            user_message_time = datetime.now()
+            assistant_message_time = user_message_time + timedelta(microseconds=1)
+            session.add(Message(conversation_id=conversation.id, role="user", content=question, created_at=user_message_time))
+            session.add(
+                Message(
+                    conversation_id=conversation.id,
+                    role="assistant",
+                    content=answer,
+                    model="",
+                    references_json=json.dumps(references, ensure_ascii=False),
+                    created_at=assistant_message_time,
+                )
+            )
+            updated_memory = self.memory_service.update_from_turn(session, case.id, question, answer)
+            yield "memory", {"memory": self.memory_service.to_dict(updated_memory)}
+            yield "steps", {"steps": final_steps or ["问题分析", "案例检索", "答案生成", "引用校验"]}
+            yield "done", {
+                "ok": True,
+                "intent": final_intent,
+                "confidence": final_confidence,
+                "case_id": case.id,
+                "conversation_id": conversation.id,
+            }
+
     def create_case(self, title, case_no="", case_type="法律咨询"):
         with session_scope(self.session_factory) as session:
             user = self._get_default_user(session)
@@ -94,6 +153,18 @@ class ConversationService:
                 return {"deleted": False}
             session.delete(case)
             return {"deleted": True}
+
+    def rename_case(self, case_id, title):
+        title = (title or "").strip()
+        if not title:
+            raise ValueError("Case title cannot be empty")
+        with session_scope(self.session_factory) as session:
+            case = session.get(Case, case_id)
+            if case is None:
+                raise KeyError(f"Case not found: {case_id}")
+            case.title = title[:240]
+            session.flush()
+            return self._case_to_dict(case)
 
     def _resolve_case_and_conversation(self, session, question, conversation_id, case_id):
         if conversation_id:

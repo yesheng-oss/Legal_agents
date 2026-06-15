@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 
 from alembic import context
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import create_engine, pool
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -23,18 +23,37 @@ def get_url():
 
 
 def run_migrations_offline():
-    context.configure(url=get_url(), target_metadata=target_metadata, literal_binds=True, dialect_opts={"paramstyle": "named"})
+    context.configure(
+        url=get_url(),
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+        compare_type=False,
+    )
     with context.begin_transaction():
         context.run_migrations()
 
 
 def run_migrations_online():
-    config_section = config.get_section(config.config_ini_section, {})
-    config_section["sqlalchemy.url"] = get_url()
-    connectable = engine_from_config(config_section, prefix="sqlalchemy.", poolclass=pool.NullPool)
+    connect_args = {}
+    url = get_url()
+    if url.startswith("postgresql"):
+        connect_args = {"connect_timeout": 3}
+    elif url.startswith("sqlite"):
+        connect_args = {"check_same_thread": False}
+    connectable = create_engine(
+        url,
+        future=True,
+        poolclass=pool.NullPool,
+        connect_args=connect_args,
+    )
 
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata)
+        context.configure(
+            connection=connection,
+            target_metadata=target_metadata,
+            compare_type=False,
+        )
         with context.begin_transaction():
             context.run_migrations()
 

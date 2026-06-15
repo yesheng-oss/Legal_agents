@@ -1,215 +1,258 @@
-# Legal RAG Agent — 中文法律知识库问答智能体
+# 法律案例 RAG 检索问答系统
 
-基于 **RAG（检索增强生成）+ Agent 工具调用流程** 的中文法律知识库问答系统。从 Hugging Face 下载真实法律案例，构建向量索引，结合 Ollama 本地大模型进行法律问答，并通过问题分析、案例检索、答案生成、引用校验输出可追溯的法律辅助回答。
+这是一个面向中文法律问答、类案检索和案卷记忆的 RAG 检索问答系统。项目使用真实中文法律案例数据构建知识库，基于 PostgreSQL + pgvector 做语义检索，结合 PostgreSQL `pg_trgm` 关键词检索、多轮会话和流式输出，提供一个可本地演示的法律案例问答界面。
 
-## 功能
+> 本项目用于学习、作品集和面试演示，回答仅供参考，不构成正式法律意见。
 
-- 从 Hugging Face 自动下载中文法律数据集（12 万+ 条真实案例）
-- 使用 `BAAI/bge-small-zh-v1.5` 语义嵌入模型构建 Chroma 向量索引
-- 基于 Ollama `qwen2.5:7b` 进行法律知识问答
-- Agent 工具链：问题意图识别、检索策略选择、案例检索、答案生成、引用校验
-- FastAPI + Swagger 接口展示，支持结构化返回答案、参考案例、罪名、法条、置信度和风险提示
-- 小型评测集覆盖法律问答、类案检索、量刑参考、非法律问题拒答和证据不足场景
+## 项目亮点
 
-## 快速开始
-
-### 前置条件
-
-- [Ollama](https://ollama.com) 已安装并运行
-- Python 3.10+
-
-### 安装
-
-```bash
-# 1. 安装依赖
-pip install -r requirements.txt
-
-# 2. 拉取对话模型
-ollama pull qwen2.5:7b
-```
-
-### 配置 DeepSeek 与 PostgreSQL
-
-复制 `.env.example` 为 `.env`，至少填写：
-
-```text
-DATABASE_URL=postgresql+psycopg://legal_agent:legal_agent@localhost:5432/legal_agent
-LLM_PROVIDER=deepseek
-DEEPSEEK_API_KEY=your_deepseek_api_key_here
-DEEPSEEK_MODEL=deepseek-v4-flash
-```
-
-启动 PostgreSQL：
-
-```bash
-docker compose up -d postgres
-```
-
-初始化业务数据库表：
-
-```bash
-alembic upgrade head
-```
-
-如果暂时没有 DeepSeek API Key，可以把 `LLM_PROVIDER` 设置为 `ollama`，继续使用本地 `qwen2.5:7b`。
-
-### 运行
-
-```bash
-# 方式一：一键启动
-python src/app.py
-
-# 方式二：分步执行
-python src/download.py   # 下载数据
-python src/ingest.py     # 构建索引
-python src/rag.py        # 启动查询
-```
-
-Windows 下也可双击 `run.bat` 或运行 `run.ps1`。
-
-### 启动 Agent API
-
-```bash
-uvicorn src.api:app --reload --host 127.0.0.1 --port 8000
-```
-
-打开法律 AI 工作台演示界面：
-
-```text
-http://127.0.0.1:8000/docs
-```
-
-界面包含三栏式工作台：左侧案卷与法规工具导航、中间智能对话与证据链、右侧法条/案例推荐、证据链图谱和法律意见书预览。
-
-打开 Swagger API 文档：
-
-```text
-http://127.0.0.1:8000/api-docs
-```
-
-接口说明：
-
-- `POST /chat`：输入法律问题，返回 Agent 最终回答、置信度、风险提示和参考案例。
-- `GET /cases`：返回案卷列表，用于工作台左侧边栏。
-- `POST /cases`：创建新案卷。
-- `GET /conversations?case_id=...`：返回案卷下的会话列表。
-- `GET /conversations/{conversation_id}`：返回完整多轮消息历史。
-- `GET /cases/{case_id}/memory`：返回案件长期记忆摘要。
-- `POST /retrieve`：只返回检索结果，便于展示 RAG 召回效果。
-- `GET /health`：检查向量库和 Ollama 服务状态。
-
-示例请求：
-
-```json
-{
-  "question": "盗窃他人财物会承担什么法律责任？",
-  "case_id": "可选案卷ID",
-  "conversation_id": "可选会话ID"
-}
-```
-
-## 项目结构
-
-```
-├── src/
-│   ├── config.py      # 配置（模型、路径等）
-│   ├── download.py    # Hugging Face 数据下载
-│   ├── ingest.py      # 数据处理与索引构建
-│   ├── rag.py         # RAG 查询引擎
-│   ├── agent.py       # 法律问答 Agent 工具链
-│   ├── llm.py         # DeepSeek / Ollama 模型适配层
-│   ├── db.py          # SQLAlchemy 数据库会话
-│   ├── models.py      # PostgreSQL ORM 模型
-│   ├── memory.py      # 案件长期记忆服务
-│   ├── conversation_service.py # 多轮会话与案卷服务
-│   ├── api.py         # FastAPI / Swagger 接口
-│   └── app.py         # CLI 交互入口
-├── alembic/           # PostgreSQL 数据库迁移
-├── tests/             # Agent 与 API 自动化测试
-├── eval_cases.json    # 小型场景评测集
-├── data/
-│   ├── raw/           # 原始法律案例数据
-│   └── chroma/        # Chroma 向量索引
-├── requirements.txt
-├── run.bat / run.ps1  # 一键启动脚本
-└── README.md
-```
-
-## 数据来源
-
-- **数据集**: [SunSpace0923/Refined-Chinese-Legal-Dataset](https://huggingface.co/datasets/SunSpace0923/Refined-Chinese-Legal-Dataset)
-- **规模**: ~12.3 万条中文法律案例
-- **字段**: 案情事实 (fact)、罪名 (accusation)、相关法条 (relevant_articles)、刑期 (term_of_imprisonment)
+- **演示数据集**：原始数据来源为 Hugging Face `SunSpace0923/Refined-Chinese-Legal-Dataset`，支持 12 万级中文法律案例；当前仓库默认导入 1000 条案例用于本地演示。
+- **RAG 检索链路**：案例文本切块后使用 `BAAI/bge-small-zh-v1.5` 生成 512 维向量，写入 PostgreSQL/pgvector。
+- **混合检索**：同时支持 pgvector 向量召回和 PostgreSQL `pg_trgm` 关键词召回，并用 RRF 融合结果。
+- **引用可追溯**：回答结果展示参考案例，同一案件的多个切片会合并为一个来源，并支持点击查看案例详情。
+- **多轮会话**：支持案卷、会话、消息和案件长期记忆的 PostgreSQL 持久化。
+- **演示界面**：FastAPI 内置前端页面，支持流式回答、证据来源、参考详情、案卷新建/重命名/删除。
 
 ## 技术栈
 
-| 组件 | 技术选型 |
-|------|----------|
-| 向量数据库 | Chroma |
-| 嵌入模型 | BAAI/bge-small-zh-v1.5 |
-| 对话模型 | Qwen2.5:7B（通过 Ollama） |
-| 云端模型 | DeepSeek（OpenAI 兼容 API） |
-| RAG 框架 | LangChain |
-| API 服务 | FastAPI |
-| 业务数据库 | PostgreSQL + SQLAlchemy + Alembic |
-| 数据源 | Hugging Face Datasets |
+| 模块 | 技术 |
+| --- | --- |
+| API | FastAPI / Uvicorn |
+| RAG 编排 | LangChain Tool Calling + 检索兜底 |
+| LLM | DeepSeek OpenAI-compatible API / Ollama |
+| Embedding | `BAAI/bge-small-zh-v1.5` |
+| 向量库 | PostgreSQL + pgvector |
+| 关键词检索 | PostgreSQL `pg_trgm` |
+| ORM / 迁移 | SQLAlchemy + Alembic |
+| 测试 | pytest / FastAPI TestClient |
 
-## 配置
+## 启动方式选择
 
-编辑 `src/config.py`：
+本项目保留两种启动方式：
 
-```python
-EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"  # 嵌入模型
-OLLAMA_MODEL = "qwen2.5:7b"                 # 对话模型
-TOP_K = 3                                    # 检索返回的参考案例数
-CHUNK_SIZE = 512                             # 文本分块大小
+- **Docker 部署**：适合面试官、同事或服务器快速复现，PostgreSQL/pgvector 由 Docker 提供。
+- **本地无 Docker 开发/演示**：适合你自己电脑节省内存，只在本机运行 Python 服务，数据库使用本机或远程 PostgreSQL + pgvector。
+
+不建议把 SQLite 作为默认演示方案，因为当前检索 SQL 依赖 pgvector 的向量距离运算和 `pg_trgm` 文本相似度。
+
+## Docker 部署
+
+### 1. 准备配置
+
+复制 `.env.example` 为 `.env`，根据你的模型选择填写：
+
+```text
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://host.docker.internal:11434
+OLLAMA_MODEL=qwen2.5:7b
 ```
 
-如需使用其他 Ollama 模型（如 `qwen2.5:3b`），修改 `OLLAMA_MODEL` 配置项即可。
-
-模型和数据库建议通过环境变量配置：
+如果使用 DeepSeek：
 
 ```text
 LLM_PROVIDER=deepseek
-DEEPSEEK_API_KEY=...
-DATABASE_URL=postgresql+psycopg://legal_agent:legal_agent@localhost:5432/legal_agent
+DEEPSEEK_API_KEY=your_deepseek_api_key_here
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-v4-flash
 ```
 
-## Agent 流程
+### 2. 启动服务
 
-1. **Question Analyzer Tool**：判断用户问题属于法律问答、类案检索、量刑参考或非法律问题。
-2. **Retriever Tool**：根据问题类型选择检索数量，调用 Chroma 返回相关案例。
-3. **Answer Generator Tool**：将案例上下文注入提示词，通过 Ollama 生成法律分析。
-4. **Citation Checker Tool**：检查回答是否带有参考依据；证据不足时提示无法可靠回答。
+```powershell
+docker compose up -d postgres
+docker compose up app
+```
 
-## 多轮对话与记忆
+打开：
 
-系统现在支持 PostgreSQL 持久化：
+- 工作台：http://127.0.0.1:8000/docs
+- Swagger API：http://127.0.0.1:8000/api-docs
 
-- `cases` 保存案卷。
-- `conversations` 保存案卷下的多轮对话。
-- `messages` 保存每轮 user/assistant 消息。
-- `case_memories` 保存案件事实摘要、用户目标、争议焦点、已确认结论和待补证点。
+Docker 路径会保留在 `docker-compose.yml` 中，适合对外部署和复现。
 
-`POST /chat` 不传 `conversation_id` 时会自动创建新会话；传入已有 `conversation_id` 时会读取最近 6 轮历史，并注入案件记忆后再生成回答。
+## 本地无 Docker 开发/演示
+
+这种方式不启动 Docker。你需要自己准备一个支持 pgvector 的 PostgreSQL，可以是本机 PostgreSQL，也可以是 Neon、Supabase 等云端 PostgreSQL。
+
+### 1. 安装 Python 依赖
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+如果项目已有 `.venv`，直接安装依赖即可：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+### 2. 准备 PostgreSQL + pgvector
+
+本机 PostgreSQL 示例：
+
+```sql
+CREATE USER legal_agent WITH PASSWORD 'legal_agent';
+CREATE DATABASE legal_agent OWNER legal_agent;
+\c legal_agent
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
+`.env` 或当前 PowerShell 环境中配置：
+
+```text
+DATABASE_URL=postgresql+psycopg://legal_agent:legal_agent@localhost:5432/legal_agent
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:7b
+DEMO_FAST_MODE=true
+SKIP_QUERY_REWRITE=true
+SKIP_RERANK=true
+FAST_RETRIEVAL_TOP_K=3
+```
+
+如果使用远程 PostgreSQL，把 `DATABASE_URL` 换成远程连接串即可。
+
+### 3. 初始化本地数据库
+
+如果你使用的是本仓库配置好的便携版 PostgreSQL，可以先启动它：
+
+```powershell
+.\scripts\start-portable-postgres.ps1
+```
+
+默认下载并导入 1000 条原始案例用于演示，避免首次处理 12 万条数据耗时过长，也保证普通电脑上展示更稳定：
+
+```powershell
+.\scripts\init-local-db.ps1
+```
+
+如果想调整下载和导入数量，可以同时设置 `DOWNLOAD_LIMIT` 和 `INGEST_LIMIT`：
+
+```powershell
+$env:DOWNLOAD_LIMIT=3000
+$env:INGEST_LIMIT=3000
+.\scripts\init-local-db.ps1
+```
+
+如果要完整导入，清空数量限制后重新下载并运行导入脚本：
+
+```powershell
+Remove-Item Env:\DOWNLOAD_LIMIT -ErrorAction SilentlyContinue
+Remove-Item Env:\INGEST_LIMIT -ErrorAction SilentlyContinue
+.\.venv\Scripts\python.exe src\download.py
+.\.venv\Scripts\python.exe src\ingest.py
+```
+
+### 4. 启动本地服务
+
+```powershell
+.\scripts\start-local.ps1
+```
+
+或者手动启动：
+
+```powershell
+.\.venv\Scripts\uvicorn.exe src.api:app --host 127.0.0.1 --port 8000
+```
+
+打开：
+
+- 工作台：http://127.0.0.1:8000/docs
+- Swagger API：http://127.0.0.1:8000/api-docs
+
+## 数据处理流程
+
+1. `src/download.py` 默认下载 `train.json` 前 1000 条演示数据，可通过 `DOWNLOAD_LIMIT` 调整。
+2. `src/ingest.py` 读取 `train.json`，默认按 `INGEST_LIMIT=1000` 导入演示案例，提取案情、罪名、法条和刑期。
+3. 每条案例拼接成文本，并用 `RecursiveCharacterTextSplitter` 按 `CHUNK_SIZE=512`、`CHUNK_OVERLAP=64` 切块。
+4. 每个 chunk 使用 `BAAI/bge-small-zh-v1.5` 生成 embedding。
+5. chunk 文本、元数据、原始案件 ID 和向量写入 `legal_documents`。
+6. 检索时同时走向量召回和关键词召回，再融合排序后交给 LLM 生成答案。
+7. 前端证据来源会按原始案件 ID 合并同案切片，点击参考可查看完整案例详情。
+
+## 主要接口
+
+- `POST /chat`：普通法律问答，返回结构化答案。
+- `POST /chat/stream`：流式法律问答，适合前端演示。
+- `POST /retrieve`：只返回召回案例，方便展示 RAG 证据链。
+- `GET /references/{source_case_id}`：查看同一原始案件的完整参考详情。
+- `GET /cases` / `POST /cases` / `PATCH /cases/{case_id}` / `DELETE /cases/{case_id}`：案卷管理。
+- `GET /conversations` / `GET /conversations/{conversation_id}`：会话管理。
+- `GET /cases/{case_id}/memory`：查看案件长期记忆。
+- `GET /health`：查看数据库、向量库和模型服务状态。
 
 ## 测试
 
-```bash
-pytest -q
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-当前测试覆盖：
+当前测试覆盖问题意图识别、检索 fallback、引用校验、API 响应结构、多轮会话、数据库模型和 RAG 上下文拼接。
 
-- 问题意图识别与检索策略选择
-- 非法律问题拒答
-- 结构化回答与引用来源
-- 检索证据不足时的保守回答
-- `/chat`、`/retrieve`、`/health` API 响应结构
+## 常见问题
 
-## 简历描述参考
+### 1. pgvector 未安装
 
-- 构建中文法律知识库问答 Agent，基于 Hugging Face 法律案例数据集、Chroma 向量数据库和 bge-small-zh embedding 实现语义检索。
-- 设计问题分析、案例检索、答案生成、引用校验等 Agent 工具链，使系统从单轮 RAG 问答升级为可规划、可追溯的法律辅助智能体。
-- 使用 FastAPI 封装问答与检索接口，支持结构化返回参考案例、相关法条、罪名信息和风险提示，提升系统可演示性与工程化程度。
-- 构建小型评测集验证法律问答、类案检索、无关问题拒答等场景，降低大模型幻觉并提升回答可信度。
+如果迁移或导入时报 `type "vector" does not exist`，说明当前数据库没有启用 pgvector。进入目标数据库执行：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+### 2. 关键词检索报 `similarity` 不存在
+
+说明没有启用 `pg_trgm`：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
+### 3. 数据库连不上
+
+检查：
+
+```powershell
+$env:DATABASE_URL
+.\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'src'); from db import is_database_available; print(is_database_available(timeout=3))"
+```
+
+如果返回 `False`，请确认 PostgreSQL 已启动、端口正确、用户名密码正确。
+
+### 4. Ollama 未启动
+
+如果 `/health` 中 `ollama=unavailable`，先启动 Ollama 并拉取模型：
+
+```powershell
+ollama pull qwen2.5:7b
+ollama serve
+```
+
+也可以改用 DeepSeek，并配置 `DEEPSEEK_API_KEY`。
+
+### 5. Alembic 迁移卡住或失败
+
+优先使用：
+
+```powershell
+.\.venv\Scripts\python.exe -m alembic upgrade head
+```
+
+如果仍失败，先确认数据库连接和扩展可用，再检查是否有残留的 `alembic.exe` 进程占用连接。
+
+## 面试展示建议
+
+可以按这个顺序讲：
+
+1. **为什么做**：法律问答需要可追溯依据，单纯 LLM 容易幻觉，所以使用 RAG + 引用校验。
+2. **数据怎么来**：原始数据支持 12 万级真实法律案例，演示版默认选取 1000 条导入，抽取案情、罪名、法条和刑期后切块入库。
+3. **怎么检索**：向量检索解决语义相似，关键词检索补足法条/罪名命中，RRF 融合提升稳定性。
+4. **引用怎么展示**：同一案件的多个切片会合并成一个参考来源，用户可以点击查看完整参考详情。
+5. **工程化亮点**：FastAPI、PostgreSQL 持久化、多轮会话、案件记忆、SSE 流式输出、自动化测试、本地无 Docker 和 Docker 双启动路径。
+
+## 当前限制
+
+- 不是正式法律服务，不能替代律师意见。
+- 演示模式默认开启 `DEMO_FAST_MODE=true`，会跳过部分重排序逻辑以保证响应速度。
+- 完整导入 12 万条数据需要较长时间和较好的本地硬件，面试演示建议先用 `INGEST_LIMIT=1000` 准备小规模知识库。

@@ -1,19 +1,27 @@
+import json
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
+from starlette.concurrency import run_in_threadpool
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from agent import LegalAgent
 from conversation_service import ConversationService
-from db import create_session_factory, init_db
+from db import create_session_factory, init_db, is_database_available
 from models import Base
+from settings import get_settings
 
+
+# ---------------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------------
 
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, description="用户法律问题")
@@ -32,85 +40,422 @@ class CaseCreateRequest(BaseModel):
     case_type: str = Field(default="法律咨询", description="案由")
 
 
+class CaseUpdateRequest(BaseModel):
+    title: str = Field(..., min_length=1, description="案卷标题")
+
+
+# ---------------------------------------------------------------------------
+# Response models
+# ---------------------------------------------------------------------------
+
+class ReferenceItem(BaseModel):
+    id: int
+    content: str
+    accusations: str = ""
+    articles: str = ""
+    punishment: int = 0
+    source_case_id: str = ""
+    chunk_count: int = 1
+
+
+class ReferenceDetailResponse(BaseModel):
+    source_case_id: str
+    accusations: str = ""
+    articles: str = ""
+    punishment: int = 0
+    full_content: str = ""
+    chunks: list[dict] = []
+
+
+class ChatResponse(BaseModel):
+    question: str
+    intent: str
+    answer: str
+    confidence: str
+    risk_notice: str = ""
+    references: list[ReferenceItem] = []
+    steps: list[str] = []
+    case_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+    memory: Optional[dict] = None
+
+
+class RetrieveResponse(BaseModel):
+    question: str
+    results: list[ReferenceItem]
+
+
+class CaseResponse(BaseModel):
+    id: str
+    title: str
+    case_no: str = ""
+    case_type: str = ""
+    status: str = ""
+
+
+class ConversationResponse(BaseModel):
+    id: str
+    case_id: str
+    title: str
+
+
+class MessageItem(BaseModel):
+    id: str = ""
+    role: str
+    content: str
+    model: str = ""
+    references: list = []
+
+
+class ConversationDetailResponse(BaseModel):
+    id: str
+    case_id: str
+    title: str
+    messages: list[MessageItem]
+
+
+class CaseMemoryResponse(BaseModel):
+    case_id: str
+    facts_summary: str = ""
+    user_goal: str = ""
+    dispute_focus: str = ""
+    confirmed_points: str = ""
+    missing_evidence: str = ""
+
+
+class HealthResponse(BaseModel):
+    status: str
+    database: str
+    vector_store: str = ""
+    ollama: str = ""
+
+
+class DeleteResponse(BaseModel):
+    deleted: bool
+
+
+# ---------------------------------------------------------------------------
+# Dependencies (module-level state, reset per create_app call)
+# ---------------------------------------------------------------------------
+
+_legal_agent: Optional[LegalAgent] = None
+_conversation_service: Optional[ConversationService] = None
+
+
+def get_agent() -> LegalAgent:
+    global _legal_agent
+    if _legal_agent is None:
+        _legal_agent = LegalAgent()
+    return _legal_agent
+
+
+def get_service() -> ConversationService:
+    if _conversation_service is None:
+        if not is_database_available(timeout=1):
+            raise HTTPException(
+                status_code=503,
+                detail="数据库未连接：请先启动 PostgreSQL/Docker，再重新点击按钮。",
+            )
+        session_factory = create_session_factory()
+        init_db(Base.metadata, session_factory)
+        return ConversationService(session_factory=session_factory, agent=get_agent())
+    return _conversation_service
+
+
+def warmup_retrieval_models():
+    try:
+        if not get_settings().warmup_retrieval:
+            return
+        agent = get_agent()
+        vector_retriever = getattr(getattr(agent, "rag", None), "vector_retriever", None)
+        embed_model = getattr(vector_retriever, "embed_model", None)
+        if embed_model is not None:
+            embed_model.encode("法律检索预热")
+    except Exception:
+        return
+
+
+def get_reference_detail(source_case_id: str):
+    session_factory = create_session_factory()
+    with session_factory() as session:
+        rows = session.execute(
+            text(
+                """
+                SELECT content, accusations, articles, punishment, source_chunk_index
+                FROM legal_documents
+                WHERE source_case_id = :source_case_id
+                ORDER BY source_chunk_index ASC, id ASC
+                """
+            ),
+            {"source_case_id": source_case_id},
+        ).all()
+
+    if not rows:
+        raise KeyError(f"Reference not found: {source_case_id}")
+
+    chunks = [
+        {
+            "index": row._mapping.get("source_chunk_index", index),
+            "content": row._mapping.get("content", ""),
+        }
+        for index, row in enumerate(rows)
+    ]
+    first = rows[0]._mapping
+    return {
+        "source_case_id": source_case_id,
+        "accusations": first.get("accusations", ""),
+        "articles": first.get("articles", ""),
+        "punishment": first.get("punishment", 0),
+        "full_content": "\n\n".join(chunk["content"] for chunk in chunks if chunk["content"]),
+        "chunks": chunks,
+    }
+
+
 def create_app(agent=None, conversation_service=None):
+    global _legal_agent, _conversation_service
+    _legal_agent = agent
+    _conversation_service = conversation_service
+
     app = FastAPI(
-        title="中文法律问答 Agent",
-        description="基于 RAG、Agent 工具调用和多轮记忆的中文法律知识库问答系统",
+        title="法律案例 RAG 检索问答系统",
+        description="基于 RAG、混合检索和多轮案卷记忆的中文法律案例问答系统",
         version="1.0.0",
         docs_url="/api-docs",
         redoc_url=None,
     )
-    legal_agent = agent
-    service = conversation_service
 
-    def get_agent():
-        nonlocal legal_agent
-        if legal_agent is None:
-            legal_agent = LegalAgent()
-        return legal_agent
+    @app.on_event("startup")
+    async def warmup_on_startup():
+        if _legal_agent is not None:
+            return
+        threading.Thread(target=warmup_retrieval_models, daemon=True).start()
 
-    def get_service():
-        nonlocal service
-        if service is None:
-            session_factory = create_session_factory()
-            init_db(Base.metadata, session_factory)
-            service = ConversationService(session_factory=session_factory, agent=get_agent())
-        return service
-
-    @app.post("/chat")
-    def chat(request: ChatRequest):
-        if conversation_service is not None or request.conversation_id or request.case_id:
-            return get_service().chat(
-                question=request.question,
-                conversation_id=request.conversation_id,
-                case_id=request.case_id,
-            )
-        if agent is not None:
-            return get_agent().chat(request.question)
-        return get_service().chat(question=request.question)
-
-    @app.post("/retrieve")
-    def retrieve(request: RetrieveRequest):
-        return {"question": request.question, "results": get_agent().retrieve(request.question, request.top_k)}
-
-    @app.get("/cases")
-    def list_cases():
-        return get_service().list_cases()
-
-    @app.post("/cases")
-    def create_case(request: CaseCreateRequest):
-        return get_service().create_case(title=request.title, case_no=request.case_no, case_type=request.case_type)
-
-    @app.delete("/cases/{case_id}")
-    def delete_case(case_id: str):
-        return get_service().delete_case(case_id)
-
-    @app.get("/conversations")
-    def list_conversations(case_id: Optional[str] = None):
-        return get_service().list_conversations(case_id=case_id)
-
-    @app.get("/conversations/{conversation_id}")
-    def get_conversation(conversation_id: str):
-        return get_service().get_conversation(conversation_id)
-
-    @app.get("/cases/{case_id}/memory")
-    def get_case_memory(case_id: str):
-        return get_service().get_case_memory(case_id)
-
-    @app.get("/health")
-    def health():
+    @app.post("/chat", response_model=ChatResponse)
+    async def chat(
+        request: ChatRequest,
+        agent_dep: LegalAgent = Depends(get_agent),
+    ):
         try:
-            session_factory = create_session_factory()
-            with session_factory() as session:
-                session.execute(text("select 1"))
-            db_status = "ok"
-        except Exception:
-            db_status = "unavailable"
+            if _conversation_service is not None or request.conversation_id or request.case_id:
+                service_dep = get_service()
+                result = await run_in_threadpool(
+                    service_dep.chat,
+                    question=request.question,
+                    conversation_id=request.conversation_id,
+                    case_id=request.case_id,
+                )
+                return result
+            if _legal_agent is not None:
+                result = await run_in_threadpool(agent_dep.chat, request.question)
+                return result
+            service_dep = get_service()
+            result = await run_in_threadpool(service_dep.chat, question=request.question)
+            return result
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Agent执行出错：{exc}")
 
-        if legal_agent is None:
+    @app.post("/chat/stream")
+    async def chat_stream(
+        request: ChatRequest,
+        agent_dep: LegalAgent = Depends(get_agent),
+    ):
+        def sse(event: str, payload: dict) -> str:
+            return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        def result_events(result: dict):
+            yield sse(
+                "meta",
+                {
+                    "question": result.get("question", request.question),
+                    "intent": result.get("intent", "unknown"),
+                    "confidence": result.get("confidence", "unknown"),
+                    "risk_notice": result.get("risk_notice", ""),
+                    "case_id": result.get("case_id"),
+                    "conversation_id": result.get("conversation_id"),
+                },
+            )
+            answer = result.get("answer", "")
+            for index in range(0, len(answer), 48):
+                yield sse("delta", {"text": answer[index : index + 48]})
+            yield sse("references", {"references": result.get("references", [])})
+            yield sse("memory", {"memory": result.get("memory") or {}})
+            yield sse("steps", {"steps": result.get("steps", [])})
+            yield sse("done", {"ok": True})
+
+        def generate():
+            try:
+                if _conversation_service is not None or request.conversation_id or request.case_id:
+                    service_dep = get_service()
+                    if hasattr(service_dep, "chat_stream_events"):
+                        try:
+                            for event_name, payload in service_dep.chat_stream_events(
+                                question=request.question,
+                                conversation_id=request.conversation_id,
+                                case_id=request.case_id,
+                            ):
+                                yield sse(event_name, payload)
+                            return
+                        except Exception:
+                            result = service_dep.chat(
+                                question=request.question,
+                                conversation_id=request.conversation_id,
+                                case_id=request.case_id,
+                            )
+                            yield from result_events(result)
+                            return
+                    result = service_dep.chat(
+                        question=request.question,
+                        conversation_id=request.conversation_id,
+                        case_id=request.case_id,
+                    )
+                elif _legal_agent is not None:
+                    result = agent_dep.chat(request.question)
+                else:
+                    service_dep = get_service()
+                    if hasattr(service_dep, "chat_stream_events"):
+                        try:
+                            for event_name, payload in service_dep.chat_stream_events(question=request.question):
+                                yield sse(event_name, payload)
+                            return
+                        except Exception:
+                            result = service_dep.chat(question=request.question)
+                            yield from result_events(result)
+                            return
+                    result = service_dep.chat(question=request.question)
+                yield from result_events(result)
+            except HTTPException as exc:
+                yield sse("error", {"message": exc.detail})
+            except Exception as exc:
+                yield sse("error", {"message": f"Agent执行出错：{exc}"})
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
+    @app.post("/retrieve", response_model=RetrieveResponse)
+    async def retrieve(
+        request: RetrieveRequest,
+        agent_dep: LegalAgent = Depends(get_agent),
+    ):
+        try:
+            results = await run_in_threadpool(
+                agent_dep.retrieve, request.question, request.top_k
+            )
+            return {"question": request.question, "results": results}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"检索出错：{exc}")
+
+    @app.get("/cases", response_model=list[CaseResponse])
+    async def list_cases(service_dep: ConversationService = Depends(get_service)):
+        try:
+            return await run_in_threadpool(service_dep.list_cases)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"查询案卷出错：{exc}")
+
+    @app.post("/cases", response_model=CaseResponse)
+    async def create_case(
+        request: CaseCreateRequest,
+        service_dep: ConversationService = Depends(get_service),
+    ):
+        try:
+            return await run_in_threadpool(
+                service_dep.create_case,
+                title=request.title,
+                case_no=request.case_no,
+                case_type=request.case_type,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"创建案卷出错：{exc}")
+
+    @app.patch("/cases/{case_id}", response_model=CaseResponse)
+    async def rename_case(
+        case_id: str,
+        request: CaseUpdateRequest,
+        service_dep: ConversationService = Depends(get_service),
+    ):
+        try:
+            return await run_in_threadpool(
+                service_dep.rename_case,
+                case_id,
+                request.title,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"重命名案卷出错：{exc}")
+
+    @app.delete("/cases/{case_id}", response_model=DeleteResponse)
+    async def delete_case(
+        case_id: str,
+        service_dep: ConversationService = Depends(get_service),
+    ):
+        try:
+            return await run_in_threadpool(service_dep.delete_case, case_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"删除案卷出错：{exc}")
+
+    @app.get("/conversations", response_model=list[ConversationResponse])
+    async def list_conversations(
+        case_id: Optional[str] = None,
+        service_dep: ConversationService = Depends(get_service),
+    ):
+        try:
+            return await run_in_threadpool(service_dep.list_conversations, case_id=case_id)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"查询会话出错：{exc}")
+
+    @app.get("/conversations/{conversation_id}", response_model=ConversationDetailResponse)
+    async def get_conversation(
+        conversation_id: str,
+        service_dep: ConversationService = Depends(get_service),
+    ):
+        try:
+            return await run_in_threadpool(
+                service_dep.get_conversation, conversation_id
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"查询会话出错：{exc}")
+
+    @app.get("/cases/{case_id}/memory", response_model=CaseMemoryResponse)
+    async def get_case_memory(
+        case_id: str,
+        service_dep: ConversationService = Depends(get_service),
+    ):
+        try:
+            return await run_in_threadpool(service_dep.get_case_memory, case_id)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"查询记忆出错：{exc}")
+
+    @app.get("/references/{source_case_id}", response_model=ReferenceDetailResponse)
+    async def reference_detail(source_case_id: str):
+        try:
+            return await run_in_threadpool(get_reference_detail, source_case_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"查询参考详情出错：{exc}")
+
+    @app.get("/health", response_model=HealthResponse)
+    async def health():
+        db_available = await run_in_threadpool(is_database_available, timeout=1)
+        db_status = "ok" if db_available else "unavailable"
+
+        if not db_available:
+            return {
+                "status": "degraded",
+                "database": db_status,
+                "vector_store": "unavailable",
+                "ollama": "not_checked",
+            }
+
+        if _legal_agent is None:
             result = LegalAgent(rag=object()).health()
         else:
-            result = get_agent().health()
+            result = await run_in_threadpool(get_agent().health)
         result["database"] = db_status
         if db_status != "ok":
             result["status"] = "degraded"
@@ -127,13 +472,13 @@ def create_app(agent=None, conversation_service=None):
 app = create_app()
 
 
-DEMO_HTML = """
+DEMO_HTML = r"""
 <!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Legal AI Workbench</title>
+  <title>法律案例 RAG 检索问答系统</title>
   <style>
     :root {
       --navy: #0f172a;
@@ -148,6 +493,11 @@ DEMO_HTML = """
       --danger: #b42318;
     }
     * { box-sizing: border-box; }
+    #codex-browser-sidebar-comments-root,
+    #codex-browser-sidebar-comments-root * {
+      display: none !important;
+      pointer-events: none !important;
+    }
     body {
       margin: 0;
       min-height: 100vh;
@@ -242,6 +592,12 @@ DEMO_HTML = """
       border-radius: 6px;
       padding: 11px;
     }
+    .case-title-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: flex-start;
+    }
     .case-item.active {
       border-color: rgba(217,119,6,.72);
       background: rgba(217,119,6,.13);
@@ -257,6 +613,20 @@ DEMO_HTML = """
       margin-top: 4px;
       color: #a7b0c0;
       font-size: 12px;
+    }
+    .rename-case-btn {
+      border: 1px solid rgba(255,255,255,.16);
+      background: rgba(255,255,255,.08);
+      color: #dbeafe;
+      border-radius: 999px;
+      padding: 3px 7px;
+      font-size: 11px;
+      font-weight: 700;
+      flex: 0 0 auto;
+    }
+    .delete-case-btn {
+      border-color: rgba(248,113,113,.22);
+      color: #fecaca;
     }
     .security-note {
       margin-top: auto;
@@ -359,6 +729,45 @@ DEMO_HTML = """
       color: var(--navy);
       font-size: 14px;
     }
+    .answer-meta {
+      margin: 0 0 12px;
+      color: #344054;
+      font-size: 13px;
+    }
+    .answer-content {
+      line-height: 1.85;
+      color: var(--ink);
+      font-size: 15px;
+    }
+    .answer-content h2, .answer-content h3 {
+      margin: 16px 0 8px;
+      color: var(--navy);
+      line-height: 1.35;
+    }
+    .answer-content h2 {
+      font-size: 19px;
+      padding-bottom: 7px;
+      border-bottom: 1px solid var(--line);
+    }
+    .answer-content h3 { font-size: 16px; }
+    .answer-content p { margin: 8px 0; }
+    .answer-content ul, .answer-content ol {
+      margin: 8px 0 10px 20px;
+      padding: 0;
+    }
+    .answer-content li { margin: 5px 0; }
+    .answer-content .citation {
+      display: inline-grid;
+      place-items: center;
+      min-width: 24px;
+      height: 24px;
+      border-radius: 999px;
+      background: #e8efff;
+      color: var(--blue);
+      font-weight: 800;
+      font-size: 12px;
+      margin: 0 2px;
+    }
     .risk {
       border: 1px solid #f2c36b;
       background: #fffbeb;
@@ -427,6 +836,15 @@ DEMO_HTML = """
       background: #fff;
       line-height: 1.65;
     }
+    .reference-item.clickable {
+      cursor: pointer;
+      transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease;
+    }
+    .reference-item.clickable:hover {
+      border-color: rgba(30,58,138,.45);
+      box-shadow: 0 8px 20px rgba(15,23,42,.08);
+      transform: translateY(-1px);
+    }
     .reference-item strong {
       color: var(--navy);
       font-size: 13px;
@@ -435,6 +853,23 @@ DEMO_HTML = """
       margin: 6px 0 0;
       color: var(--muted);
       font-size: 12px;
+    }
+    .reference-detail {
+      display: grid;
+      gap: 10px;
+    }
+    .reference-detail pre {
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin: 0;
+      padding: 12px;
+      border-radius: 7px;
+      background: #f8fafc;
+      border: 1px solid var(--line);
+      line-height: 1.75;
+      color: #344054;
+      font-family: inherit;
+      font-size: 13px;
     }
     .memory-grid {
       display: grid;
@@ -504,14 +939,14 @@ DEMO_HTML = """
     <aside class="case-sidebar">
       <section class="brand">
         <div class="brand-mark">LAW</div>
-        <h1>Legal AI Workbench</h1>
-        <p>面向法律问答、类案检索和案卷记忆的本地智能体工作台。</p>
+        <h1>法律案例 RAG 检索问答系统</h1>
+        <p>面向法律问答、类案检索和案卷记忆的本地演示系统。</p>
       </section>
 
       <section>
         <div class="side-head">
           <h2>案卷</h2>
-          <button class="small-btn" id="newCaseButton">新建</button>
+          <button class="small-btn" id="newCaseButton" onclick="createCase()">新建</button>
         </div>
         <div class="case-list" id="caseList">
           <button class="case-item active">
@@ -533,25 +968,15 @@ DEMO_HTML = """
         <div class="status-row">
           <span class="status-pill">向量库：<b id="vectorStatus">检测中</b></span>
           <span class="status-pill">模型：<b id="ollamaStatus">检测中</b></span>
-          <a class="status-pill" href="/api-docs">Swagger</a>
         </div>
       </header>
 
       <section class="chat-card">
         <div class="chat-head">
           <h3>当前会话</h3>
-          <button class="ghost-btn" id="retrieveButton">只检索证据</button>
+        <button class="ghost-btn" id="retrieveButton" onclick="runRetrieve()" onpointerdown="runRetrieve()">只检索证据</button>
         </div>
         <div class="conversation" id="conversation">
-          <article class="message">
-            <h4>用户问题</h4>
-            <p id="questionPreview">盗窃他人财物会承担什么法律责任？</p>
-          </article>
-          <article class="message ai">
-            <div class="risk" id="riskNotice">等待分析。回答将优先基于知识库案例和可追溯引用。</div>
-            <h4>Agent 回答</h4>
-            <div id="answerBox">输入案情或法律问题后，点击“生成法律分析”。</div>
-          </article>
           <div class="skeleton" id="skeleton">
             <div class="s-line"></div>
             <div class="s-line"></div>
@@ -564,7 +989,7 @@ DEMO_HTML = """
         <textarea id="questionInput">盗窃他人财物会承担什么法律责任？</textarea>
         <div class="composer-actions">
           <span class="hint">建议输入：案情事实、金额、证据、诉求、已知争议点。</span>
-          <button class="primary-btn" id="sendButton">生成法律分析</button>
+          <button class="primary-btn" id="sendButton" onclick="runChat()" onpointerdown="runChat()" onmousedown="runChat()">生成法律分析</button>
         </div>
       </section>
     </main>
@@ -589,39 +1014,95 @@ DEMO_HTML = """
         </div>
       </section>
 
-      <section class="evidence-card">
-        <h3>推理步骤</h3>
-        <div class="steps" id="logicChain">
-          <div class="step"><span>1</span><div>问题分析</div></div>
-          <div class="step"><span>2</span><div>案例检索</div></div>
-          <div class="step"><span>3</span><div>回答生成与引用校验</div></div>
-        </div>
-      </section>
     </aside>
   </div>
 
   <script>
     const questionInput = document.getElementById('questionInput');
-    const questionPreview = document.getElementById('questionPreview');
-    const answerBox = document.getElementById('answerBox');
-    const riskNotice = document.getElementById('riskNotice');
+    const conversationBox = document.getElementById('conversation');
     const skeleton = document.getElementById('skeleton');
     const referencesBox = document.getElementById('references');
-    const logicChain = document.getElementById('logicChain');
     const caseList = document.getElementById('caseList');
     const memoryCard = document.getElementById('memoryCard');
+    let questionPreview = null;
+    let answerBox = null;
+    let riskNotice = null;
     let currentCaseId = null;
     let currentConversationId = null;
+    let chatInFlight = false;
+    let lastReferences = [];
 
-    document.getElementById('sendButton').addEventListener('click', runChat);
-    document.getElementById('retrieveButton').addEventListener('click', runRetrieve);
-    document.getElementById('newCaseButton').addEventListener('click', createCase);
-    questionInput.addEventListener('input', syncQuestion);
+    function initLegalWorkbench() {
+      const sendButton = document.getElementById('sendButton');
+      const retrieveButton = document.getElementById('retrieveButton');
+      const newCaseButton = document.getElementById('newCaseButton');
+      window.runChat = runChat;
+      window.runRetrieve = runRetrieve;
+      window.createCase = createCase;
+      sendButton.onclick = runChat;
+      retrieveButton.onclick = runRetrieve;
+      newCaseButton.onclick = createCase;
+      questionInput.oninput = syncQuestion;
+    }
 
     async function runChat() {
-      syncQuestion();
       if (!questionInput.value.trim()) return;
+      if (chatInFlight) return;
+      chatInFlight = true;
+      prepareConversation();
+      syncQuestion();
       setLoading(true);
+      riskNotice.textContent = '正在检索证据...';
+      answerBox.innerHTML = '<p class="answer-meta"><strong>意图：</strong>分析中 · <strong>置信度：</strong>生成中</p><div class="answer-content" id="streamAnswer">正在生成法律分析...</div>';
+      let streamText = '';
+      try {
+        const response = await fetch('/chat/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            question: questionInput.value.trim(),
+            case_id: currentCaseId,
+            conversation_id: currentConversationId
+          })
+        });
+        if (!response.ok) throw new Error(`请求失败：${response.status}`);
+        await readChatStream(response, (event, payload) => {
+          if (event === 'meta') {
+            currentCaseId = payload.case_id || currentCaseId;
+            currentConversationId = payload.conversation_id || currentConversationId;
+            riskNotice.textContent = payload.risk_notice || '正在生成法律分析...';
+            answerBox.innerHTML = `
+              <p class="answer-meta"><strong>意图：</strong>${escapeHtml(payload.intent || 'unknown')} · <strong>置信度：</strong>${escapeHtml(payload.confidence || 'unknown')}</p>
+              <div class="answer-content" id="streamAnswer"></div>
+            `;
+          } else if (event === 'delta') {
+            streamText += payload.text || '';
+            const streamAnswer = document.getElementById('streamAnswer');
+            if (streamAnswer) streamAnswer.innerHTML = renderMarkdown(streamText);
+          } else if (event === 'references') {
+            renderReferences(payload.references || []);
+          } else if (event === 'memory') {
+            renderMemory(payload.memory || {});
+          } else if (event === 'steps') {
+            renderLogic(payload.steps || []);
+          } else if (event === 'error') {
+            throw new Error(payload.message || '流式响应出错');
+          }
+        });
+        if (currentCaseId) loadCases();
+      } catch (error) {
+        if (error.fromStreamEvent) {
+          renderError(error);
+        } else {
+          await runChatFallback(error);
+        }
+      } finally {
+        chatInFlight = false;
+        setLoading(false);
+      }
+    }
+
+    async function runChatFallback(originalError) {
       try {
         const response = await fetch('/chat', {
           method: 'POST',
@@ -632,17 +1113,17 @@ DEMO_HTML = """
             conversation_id: currentConversationId
           })
         });
+        if (!response.ok) throw originalError;
         renderChat(await response.json());
       } catch (error) {
         renderError(error);
-      } finally {
-        setLoading(false);
       }
     }
 
     async function runRetrieve() {
-      syncQuestion();
       if (!questionInput.value.trim()) return;
+      prepareConversation();
+      syncQuestion();
       setLoading(true);
       try {
         const response = await fetch('/retrieve', {
@@ -651,6 +1132,7 @@ DEMO_HTML = """
           body: JSON.stringify({ question: questionInput.value.trim(), top_k: 5 })
         });
         const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || `请求失败：${response.status}`);
         renderReferences(data.results || []);
         answerBox.textContent = `已检索到 ${(data.results || []).length} 条候选证据。`;
       } catch (error) {
@@ -661,7 +1143,10 @@ DEMO_HTML = """
     }
 
     async function createCase() {
-      const title = questionInput.value.trim().slice(0, 24) || '新法律咨询';
+      const suggestedTitle = questionInput.value.trim().slice(0, 24) || '新法律咨询';
+      const inputTitle = window.prompt('请输入案卷名称', suggestedTitle);
+      if (inputTitle === null) return;
+      const title = inputTitle.trim() || '未命名案卷';
       try {
         const response = await fetch('/cases', {
           method: 'POST',
@@ -678,12 +1163,13 @@ DEMO_HTML = """
     }
 
     function renderChat(data) {
+      prepareConversation();
       currentCaseId = data.case_id || currentCaseId;
       currentConversationId = data.conversation_id || currentConversationId;
       riskNotice.textContent = data.risk_notice || '回答仅供学习参考，不构成正式法律意见。';
       answerBox.innerHTML = `
-        <p><strong>意图：</strong>${escapeHtml(data.intent || 'unknown')} · <strong>置信度：</strong>${escapeHtml(data.confidence || 'unknown')}</p>
-        <p>${escapeHtml(data.answer || '暂无回答')}</p>
+        <p class="answer-meta"><strong>意图：</strong>${escapeHtml(data.intent || 'unknown')} · <strong>置信度：</strong>${escapeHtml(data.confidence || 'unknown')}</p>
+        <div class="answer-content">${renderMarkdown(data.answer || '暂无回答')}</div>
       `;
       renderReferences(data.references || []);
       renderLogic(data.steps || []);
@@ -691,24 +1177,78 @@ DEMO_HTML = """
       if (currentCaseId) loadCases();
     }
 
+    async function readChatStream(response, onEvent) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split(String.fromCharCode(10, 10));
+        buffer = events.pop() || '';
+        events.forEach((rawEvent) => {
+          const lines = rawEvent.split(String.fromCharCode(10));
+          const eventLine = lines.find((line) => line.startsWith('event: '));
+          const dataLine = lines.find((line) => line.startsWith('data: '));
+          if (!eventLine || !dataLine) return;
+          const event = eventLine.slice(7).trim();
+          const payload = JSON.parse(dataLine.slice(6));
+          if (event === 'error') {
+            const error = new Error(payload.message || '流式响应出错');
+            error.fromStreamEvent = true;
+            throw error;
+          }
+          onEvent(event, payload);
+        });
+      }
+    }
+
     function renderReferences(refs) {
+      lastReferences = refs || [];
       if (!refs.length) {
         referencesBox.innerHTML = '<div class="reference-item"><strong>暂无可引用证据</strong><p>知识库未返回足够材料时，系统应提示无法可靠判断。</p></div>';
         return;
       }
       referencesBox.innerHTML = refs.map((ref) => `
-        <div class="reference-item">
+        <div class="reference-item clickable" data-source-case-id="${escapeHtml(ref.source_case_id || '')}">
           <strong>参考 ${escapeHtml(String(ref.id || '-'))} · ${escapeHtml(ref.accusations || '未标注罪名/案由')}</strong>
-          <p>法条：${escapeHtml(ref.articles || '未标注')} · 刑期/结果：${escapeHtml(String(ref.punishment ?? '-'))}<br>${escapeHtml(truncate(ref.content || '', 150))}</p>
+          <p>法条：${escapeHtml(ref.articles || '未标注')} · 刑期/结果：${escapeHtml(String(ref.punishment ?? '-'))} · 切片：${escapeHtml(String(ref.chunk_count || 1))}<br>${escapeHtml(truncate(ref.content || '', 180))}</p>
+          <p><b>点击查看完整案例详情</b></p>
         </div>
       `).join('');
+      referencesBox.querySelectorAll('.reference-item.clickable').forEach((item) => {
+        item.addEventListener('click', () => {
+          const sourceCaseId = item.dataset.sourceCaseId;
+          if (sourceCaseId) loadReferenceDetail(sourceCaseId);
+        });
+      });
+    }
+
+    async function loadReferenceDetail(sourceCaseId) {
+      try {
+        window.location.hash = `reference/${encodeURIComponent(sourceCaseId)}`;
+        referencesBox.innerHTML = '<div class="reference-item"><strong>正在加载参考详情...</strong><p>正在整理同一案件的全部切片。</p></div>';
+        const response = await fetch(`/references/${encodeURIComponent(sourceCaseId)}`);
+        const detail = await response.json();
+        if (!response.ok) throw new Error(detail.detail || `请求失败：${response.status}`);
+        referencesBox.innerHTML = `
+          <div class="reference-detail">
+            <button class="ghost-btn" onclick="renderReferences(lastReferences)">返回证据列表</button>
+            <div class="reference-item">
+              <strong>${escapeHtml(detail.accusations || '未标注罪名/案由')}</strong>
+              <p>法条：${escapeHtml(detail.articles || '未标注')} · 刑期/结果：${escapeHtml(String(detail.punishment ?? '-'))} · 共 ${escapeHtml(String((detail.chunks || []).length))} 个切片</p>
+            </div>
+            <pre>${escapeHtml(detail.full_content || '暂无详情')}</pre>
+          </div>
+        `;
+      } catch (error) {
+        referencesBox.innerHTML = `<div class="reference-item"><strong>参考详情加载失败</strong><p>${escapeHtml(error.message)}</p></div>`;
+      }
     }
 
     function renderLogic(steps) {
-      const names = steps.length ? steps : ['问题分析', '案例检索', '回答生成与引用校验'];
-      logicChain.innerHTML = names.map((step, index) => `
-        <div class="step"><span>${index + 1}</span><div>${escapeHtml(step)}</div></div>
-      `).join('');
+      return;
     }
 
     function renderMemory(memory) {
@@ -738,10 +1278,16 @@ DEMO_HTML = """
         if (!Array.isArray(cases) || !cases.length) return;
         currentCaseId = currentCaseId || cases[0].id;
         caseList.innerHTML = cases.map((item) => `
-          <button class="case-item ${item.id === currentCaseId ? 'active' : ''}" data-case-id="${escapeHtml(item.id)}">
-            <strong>${escapeHtml(item.case_no || '【案卷】')} ${escapeHtml(item.title)}</strong>
+          <div class="case-item ${item.id === currentCaseId ? 'active' : ''}" data-case-id="${escapeHtml(item.id)}" role="button" tabindex="0">
+            <div class="case-title-row">
+              <strong>${escapeHtml(item.case_no || '【案卷】')} ${escapeHtml(cleanTitle(item.title))}</strong>
+              <span>
+                <button class="rename-case-btn" data-case-id="${escapeHtml(item.id)}" data-title="${escapeHtml(item.title || '')}">重命名</button>
+                <button class="rename-case-btn delete-case-btn" data-case-id="${escapeHtml(item.id)}" data-title="${escapeHtml(item.title || '')}">删除</button>
+              </span>
+            </div>
             <span>${escapeHtml(item.case_type || '法律咨询')} · ${escapeHtml(item.status || 'active')}</span>
-          </button>
+          </div>
         `).join('');
         caseList.querySelectorAll('.case-item').forEach((button) => {
           button.addEventListener('click', () => {
@@ -751,9 +1297,58 @@ DEMO_HTML = """
             loadCases();
           });
         });
+        caseList.querySelectorAll('.rename-case-btn:not(.delete-case-btn)').forEach((button) => {
+          button.addEventListener('click', (event) => {
+            event.stopPropagation();
+            renameCase(button.dataset.caseId, button.dataset.title || '');
+          });
+        });
+        caseList.querySelectorAll('.delete-case-btn').forEach((button) => {
+          button.addEventListener('click', (event) => {
+            event.stopPropagation();
+            deleteCase(button.dataset.caseId, button.dataset.title || '');
+          });
+        });
         loadCaseMemory(currentCaseId);
       } catch {
         return;
+      }
+    }
+
+    async function deleteCase(caseId, currentTitle) {
+      const title = cleanTitle(currentTitle) || '该案卷';
+      if (!window.confirm(`确定删除「${title}」吗？删除后该案卷下的会话也会被移除。`)) return;
+      try {
+        const response = await fetch(`/cases/${caseId}`, { method: 'DELETE' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || `请求失败：${response.status}`);
+        if (currentCaseId === caseId) {
+          currentCaseId = null;
+          currentConversationId = null;
+        }
+        await loadCases();
+      } catch (error) {
+        renderError(error);
+      }
+    }
+
+    async function renameCase(caseId, currentTitle) {
+      const inputTitle = window.prompt('请输入新的案卷名称', cleanTitle(currentTitle));
+      if (inputTitle === null) return;
+      const title = inputTitle.trim();
+      if (!title) return;
+      try {
+        const response = await fetch(`/cases/${caseId}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title })
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || `请求失败：${response.status}`);
+        currentCaseId = data.id || caseId;
+        await loadCases();
+      } catch (error) {
+        renderError(error);
       }
     }
 
@@ -768,7 +1363,9 @@ DEMO_HTML = """
     }
 
     function syncQuestion() {
-      questionPreview.textContent = questionInput.value.trim() || '请输入法律问题。';
+      if (questionPreview) {
+        questionPreview.textContent = questionInput.value.trim() || '请输入法律问题。';
+      }
     }
 
     function setLoading(active) {
@@ -776,19 +1373,101 @@ DEMO_HTML = """
     }
 
     function renderError(error) {
+      prepareConversation();
       riskNotice.textContent = '请求失败';
       answerBox.textContent = error.message;
+    }
+
+    function prepareConversation() {
+      if (answerBox && riskNotice && questionPreview) return;
+      conversationBox.querySelectorAll('.message').forEach((item) => item.remove());
+      const questionArticle = document.createElement('article');
+      questionArticle.className = 'message';
+      questionArticle.innerHTML = '<h4>用户问题</h4><p id="questionPreview"></p>';
+      const answerArticle = document.createElement('article');
+      answerArticle.className = 'message ai';
+      answerArticle.innerHTML = '<div class="risk" id="riskNotice">正在准备分析...</div><h4>Agent 回答</h4><div id="answerBox"></div>';
+      conversationBox.insertBefore(questionArticle, skeleton);
+      conversationBox.insertBefore(answerArticle, skeleton);
+      questionPreview = document.getElementById('questionPreview');
+      answerBox = document.getElementById('answerBox');
+      riskNotice = document.getElementById('riskNotice');
     }
 
     function truncate(text, max) {
       return text.length > max ? `${text.slice(0, max)}...` : text;
     }
 
+    function cleanTitle(title) {
+      const value = String(title || '').trim();
+      const questionMarks = (value.match(/\?/g) || []).length;
+      const mojibake = /[ÃÂ�]/.test(value) || /[çäåæèéêëìíîïðñòóôõöùúûü]/i.test(value);
+      if (!value || questionMarks >= 4 || mojibake) return '未命名案卷';
+      return value;
+    }
+
+    function renderMarkdown(markdown) {
+      const newline = String.fromCharCode(10);
+      const lines = String(markdown || '').replace(/\r\n/g, newline).split(newline);
+      const html = [];
+      let listType = null;
+      const closeList = () => {
+        if (listType) {
+          html.push(`</${listType}>`);
+          listType = null;
+        }
+      };
+      lines.forEach((rawLine) => {
+        const line = rawLine.trim();
+        if (!line) {
+          closeList();
+          return;
+        }
+        const heading = line.match(/^(#{2,3})\s+(.+)$/);
+        if (heading) {
+          closeList();
+          const level = heading[1].length;
+          html.push(`<h${level}>${formatInlineMarkdown(heading[2])}</h${level}>`);
+          return;
+        }
+        const ordered = line.match(/^\d+[.、]\s+(.+)$/);
+        if (ordered) {
+          if (listType !== 'ol') {
+            closeList();
+            listType = 'ol';
+            html.push('<ol>');
+          }
+          html.push(`<li>${formatInlineMarkdown(ordered[1])}</li>`);
+          return;
+        }
+        const unordered = line.match(/^[-*]\s+(.+)$/);
+        if (unordered) {
+          if (listType !== 'ul') {
+            closeList();
+            listType = 'ul';
+            html.push('<ul>');
+          }
+          html.push(`<li>${formatInlineMarkdown(unordered[1])}</li>`);
+          return;
+        }
+        closeList();
+        html.push(`<p>${formatInlineMarkdown(line)}</p>`);
+      });
+      closeList();
+      return html.join('');
+    }
+
+    function formatInlineMarkdown(text) {
+      return escapeHtml(text)
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/【?参考案例?】?\[(\d+)\]|【(\d+)】|\[(\d+)\]/g, (_, a, b, c) => `<span class="citation">${a || b || c}</span>`);
+    }
+
     function escapeHtml(text) {
       return String(text).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
     }
 
-    syncQuestion();
+    initLegalWorkbench();
     loadHealth();
     loadCases();
   </script>

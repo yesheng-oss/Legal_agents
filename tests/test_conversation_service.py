@@ -5,6 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from conversation_service import ConversationService
 from db import create_session_factory, init_db
+from memory import MemoryService
 from models import Base
 
 
@@ -23,10 +24,25 @@ class FakeAgent:
         }
 
 
+class FakeMemoryExtractor:
+    def extract(self, question, answer, current_memory):
+        return {
+            "facts_summary": f"用户咨询：{question}",
+            "user_goal": "获得法律风险判断",
+            "dispute_focus": "法律责任认定",
+            "confirmed_points": answer[:80],
+            "missing_evidence": "需补充证据材料。",
+        }
+
+
 def make_service():
     session_factory = create_session_factory("sqlite+pysqlite:///:memory:")
     init_db(Base.metadata, session_factory)
-    return ConversationService(session_factory=session_factory, agent=FakeAgent())
+    return ConversationService(
+        session_factory=session_factory,
+        agent=FakeAgent(),
+        memory_service=MemoryService(llm_extractor=FakeMemoryExtractor()),
+    )
 
 
 def test_chat_creates_case_conversation_messages_and_memory():

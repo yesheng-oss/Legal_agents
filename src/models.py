@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import DateTime, ForeignKey, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -12,6 +13,28 @@ def new_id():
 class Base(DeclarativeBase):
     pass
 
+
+# ---------------------------------------------------------------------------
+# 法律案例向量文档（pgvector + pg_trgm）
+# ---------------------------------------------------------------------------
+
+class LegalDocument(Base):
+    __tablename__ = "legal_documents"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    accusations: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    articles: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    punishment: Mapped[int] = mapped_column(nullable=False, default=0)
+    source_case_id: Mapped[str] = mapped_column(String(80), nullable=False, default="")
+    source_chunk_index: Mapped[int] = mapped_column(nullable=False, default=0)
+    embedding: Mapped[list[float]] = mapped_column(Vector(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+
+
+# ---------------------------------------------------------------------------
+# 业务模型（案卷、会话、消息、记忆）
+# ---------------------------------------------------------------------------
 
 class User(Base):
     __tablename__ = "users"
