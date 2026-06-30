@@ -33,7 +33,6 @@
 - **Docker 部署**：适合面试官、同事或服务器快速复现，PostgreSQL/pgvector 由 Docker 提供。
 - **本地无 Docker 开发/演示**：适合你自己电脑节省内存，只在本机运行 Python 服务，数据库使用本机或远程 PostgreSQL + pgvector。
 
-不建议把 SQLite 作为默认演示方案，因为当前检索 SQL 依赖 pgvector 的向量距离运算和 `pg_trgm` 文本相似度。
 
 ## Docker 部署
 
@@ -189,70 +188,4 @@ Remove-Item Env:\INGEST_LIMIT -ErrorAction SilentlyContinue
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-当前测试覆盖问题意图识别、检索 fallback、引用校验、API 响应结构、多轮会话、数据库模型和 RAG 上下文拼接。
 
-## 常见问题
-
-### 1. pgvector 未安装
-
-如果迁移或导入时报 `type "vector" does not exist`，说明当前数据库没有启用 pgvector。进入目标数据库执行：
-
-```sql
-CREATE EXTENSION IF NOT EXISTS vector;
-```
-
-### 2. 关键词检索报 `similarity` 不存在
-
-说明没有启用 `pg_trgm`：
-
-```sql
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-```
-
-### 3. 数据库连不上
-
-检查：
-
-```powershell
-$env:DATABASE_URL
-.\.venv\Scripts\python.exe -c "import sys; sys.path.insert(0, 'src'); from db import is_database_available; print(is_database_available(timeout=3))"
-```
-
-如果返回 `False`，请确认 PostgreSQL 已启动、端口正确、用户名密码正确。
-
-### 4. Ollama 未启动
-
-如果 `/health` 中 `ollama=unavailable`，先启动 Ollama 并拉取模型：
-
-```powershell
-ollama pull qwen2.5:7b
-ollama serve
-```
-
-也可以改用 DeepSeek，并配置 `DEEPSEEK_API_KEY`。
-
-### 5. Alembic 迁移卡住或失败
-
-优先使用：
-
-```powershell
-.\.venv\Scripts\python.exe -m alembic upgrade head
-```
-
-如果仍失败，先确认数据库连接和扩展可用，再检查是否有残留的 `alembic.exe` 进程占用连接。
-
-## 面试展示建议
-
-可以按这个顺序讲：
-
-1. **为什么做**：法律问答需要可追溯依据，单纯 LLM 容易幻觉，所以使用 RAG + 引用校验。
-2. **数据怎么来**：原始数据支持 12 万级真实法律案例，演示版默认选取 1000 条导入，抽取案情、罪名、法条和刑期后切块入库。
-3. **怎么检索**：向量检索解决语义相似，关键词检索补足法条/罪名命中，RRF 融合提升稳定性。
-4. **引用怎么展示**：同一案件的多个切片会合并成一个参考来源，用户可以点击查看完整参考详情。
-5. **工程化亮点**：FastAPI、PostgreSQL 持久化、多轮会话、案件记忆、SSE 流式输出、自动化测试、本地无 Docker 和 Docker 双启动路径。
-
-## 当前限制
-
-- 不是正式法律服务，不能替代律师意见。
-- 演示模式默认开启 `DEMO_FAST_MODE=true`，会跳过部分重排序逻辑以保证响应速度。
-- 完整导入 12 万条数据需要较长时间和较好的本地硬件，面试演示建议先用 `INGEST_LIMIT=1000` 准备小规模知识库。
