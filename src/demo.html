@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>法律事务台</title>
+  <style>
+    :root {
+      --bg: #f3f2ee;
+      --surface: #ffffff;
+      --surface-2: #f9f8f4;
+      --ink: #20211f;
+      --muted: #73776f;
+      --line: #d9d8d0;
+      --rail: #282b27;
+      --rail-2: #343832;
+      --accent: #6f4a1f;
+      --accent-2: #efe7d8;
+      --danger: #b42318;
+      --ok: #20745c;
+      --shadow: 0 18px 45px rgba(32, 33, 31, .08);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--bg);
+      font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif;
+    }
+    button, textarea, input { font: inherit; }
+    button { border: 0; cursor: pointer; }
+
+    .lawdesk-app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 292px minmax(540px, 1fr) 360px;
+    }
+
+    .dossier-rail {
+      background: var(--rail);
+      color: #f4f1ea;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      border-right: 1px solid #1f211f;
+    }
+    .rail-head {
+      padding: 22px 22px 18px;
+      border-bottom: 1px solid rgba(255,255,255,.12);
+    }
+    .rail-kicker {
+      color: #bfc5bc;
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+    .rail-head h1 {
+      margin: 0;
+      font-size: 24px;
+      line-height: 1.15;
+      letter-spacing: 0;
+    }
+    .rail-meta {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 14px;
+    }
+    .rail-meta span {
+      border: 1px solid rgba(255,255,255,.16);
+      color: #d9ded6;
+      border-radius: 999px;
+      padding: 5px 9px;
+      font-size: 12px;
+    }
+
+    .dossier-section {
+      padding: 18px;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .section-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .section-row h2,
+    .side-block h3,
+    .source-docket h3 {
+      margin: 0;
+      font-size: 14px;
+      line-height: 1.2;
+    }
+    .new-case-btn {
+      width: 34px;
+      height: 34px;
+      border-radius: 7px;
+      background: #f4f1ea;
+      color: var(--rail);
+      font-weight: 900;
+      font-size: 18px;
+    }
+    .case-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+    .case-item {
+      width: 100%;
+      text-align: left;
+      color: #f4f1ea;
+      background: rgba(255,255,255,.07);
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .case-item.active {
+      background: var(--rail-2);
+      border-color: rgba(255,255,255,.28);
+    }
+    .case-title {
+      display: block;
+      font-weight: 800;
+      margin-bottom: 5px;
+    }
+    .case-sub {
+      display: block;
+      color: #bfc5bc;
+      font-size: 12px;
+    }
+    .rail-foot {
+      padding: 18px;
+      border-top: 1px solid rgba(255,255,255,.12);
+    }
+    .side-block {
+      background: rgba(255,255,255,.06);
+      border: 1px solid rgba(255,255,255,.10);
+      border-radius: 8px;
+      padding: 13px;
+    }
+    .side-block p {
+      margin: 8px 0 12px;
+      color: #d0d5ce;
+      line-height: 1.55;
+    }
+    .danger-btn {
+      min-height: 34px;
+      padding: 0 12px;
+      border-radius: 7px;
+      color: var(--danger);
+      background: #fae6e3;
+      font-weight: 800;
+    }
+
+    .workbench-main {
+      min-width: 0;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      background: var(--surface-2);
+    }
+    .case-header {
+      padding: 24px 28px 18px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+    }
+    .case-header h2 {
+      margin: 0;
+      font-size: 25px;
+      line-height: 1.2;
+    }
+    .case-header p {
+      margin: 7px 0 0;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+    .status-chip {
+      white-space: nowrap;
+      border: 1px solid var(--line);
+      background: #fbfaf7;
+      color: var(--muted);
+      border-radius: 999px;
+      padding: 7px 11px;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .case-timeline {
+      min-height: 0;
+      overflow: auto;
+      padding: 24px 28px;
+    }
+    .record-sheet {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      box-shadow: var(--shadow);
+      min-height: 500px;
+      border-radius: 10px;
+      padding: 0;
+      overflow: hidden;
+    }
+    .record-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      background: #fcfbf8;
+    }
+    .record-toolbar strong { font-size: 14px; }
+    .record-toolbar span { color: var(--muted); font-size: 12px; }
+    .answer-stream {
+      padding: 22px 24px 34px;
+      line-height: 1.86;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 15px;
+    }
+    .empty-state { color: var(--muted); }
+
+    .intake-panel {
+      border-top: 1px solid var(--line);
+      background: var(--surface);
+      padding: 18px 28px 22px;
+    }
+    .intake-box {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      box-shadow: 0 10px 30px rgba(32, 33, 31, .05);
+      overflow: hidden;
+    }
+    textarea {
+      display: block;
+      width: 100%;
+      min-height: 112px;
+      resize: vertical;
+      border: 0;
+      outline: none;
+      padding: 16px 18px;
+      color: var(--ink);
+      background: transparent;
+      line-height: 1.65;
+    }
+    .intake-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 12px 14px;
+      border-top: 1px solid var(--line);
+      background: #fcfbf8;
+    }
+    .action-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .ghost-btn,
+    .primary-btn {
+      min-height: 38px;
+      padding: 0 15px;
+      border-radius: 7px;
+      font-weight: 900;
+    }
+    .ghost-btn {
+      color: var(--ink);
+      background: var(--accent-2);
+    }
+    .primary-btn {
+      color: #fff;
+      background: var(--accent);
+    }
+    .insight-rail {
+      border-left: 1px solid var(--line);
+      background: #f8f7f2;
+      padding: 20px;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .source-docket,
+    .memory-card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 15px;
+    }
+    .source-docket p,
+    .memory-card p {
+      margin: 8px 0 0;
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 13px;
+    }
+    .reference-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .reference-card {
+      border-top: 1px solid var(--line);
+      padding-top: 11px;
+    }
+    .reference-card h4 {
+      margin: 0 0 7px;
+      font-size: 13px;
+    }
+    .reference-card p {
+      margin: 0;
+      color: var(--muted);
+    }
+    .meta-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 7px;
+      margin-top: 10px;
+    }
+    .meta-grid span {
+      background: #f2eee5;
+      color: var(--muted);
+      border-radius: 7px;
+      padding: 7px;
+      font-size: 12px;
+    }
+    .muted { color: var(--muted); }
+
+    @media (max-width: 1180px) {
+      .lawdesk-app { grid-template-columns: 260px 1fr; }
+      .insight-rail {
+        grid-column: 1 / -1;
+        border-left: 0;
+        border-top: 1px solid var(--line);
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+    }
+    @media (max-width: 760px) {
+      .lawdesk-app { display: block; }
+      .dossier-rail, .workbench-main, .insight-rail { display: block; }
+      .case-header, .case-timeline, .intake-panel, .insight-rail { padding: 16px; }
+      .case-header { display: block; }
+      .status-chip { display: inline-flex; margin-top: 12px; }
+      .source-docket, .memory-card { margin-bottom: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="lawdesk-app">
+    <aside class="dossier-rail">
+      <header class="rail-head">
+        <div class="rail-kicker">LEGAL OPS</div>
+        <h1>法律事务台</h1>
+        <div class="rail-meta">
+          <span>案例检索</span>
+          <span>案卷记录</span>
+          <span>证据来源</span>
+        </div>
+      </header>
+
+      <section class="dossier-section">
+        <div class="section-row">
+          <h2>案卷</h2>
+          <button class="new-case-btn" type="button" onclick="createCase()" title="新建案卷">+</button>
+        </div>
+        <div id="caseList" class="case-list"></div>
+      </section>
+
+      <footer class="rail-foot">
+        <section class="side-block">
+          <h3>当前记录</h3>
+          <p id="conversationLabel">未命名案卷</p>
+          <button class="danger-btn" type="button" onclick="deleteCase()">删除</button>
+        </section>
+      </footer>
+    </aside>
+
+    <section class="workbench-main">
+      <header class="case-header">
+        <div>
+          <h2>咨询记录</h2>
+          <p>按事实、争议、依据和风险整理答复。</p>
+        </div>
+        <div id="streamStatus" class="status-chip">待处理</div>
+      </header>
+
+      <section class="case-timeline">
+        <article class="record-sheet">
+          <div class="record-toolbar">
+            <strong>答复正文</strong>
+            <span>自动保存到当前案卷</span>
+          </div>
+          <div id="answerStream" class="answer-stream empty-state">尚无咨询记录。请填写案情事实、争议焦点或待核验问题。</div>
+        </article>
+      </section>
+
+      <section class="intake-panel">
+        <div class="intake-box">
+          <textarea id="questionInput" placeholder="例如：盗窃他人财物会承担什么法律责任？"></textarea>
+          <div class="intake-actions">
+            <span></span>
+            <div class="action-group">
+              <button class="ghost-btn" type="button" onclick="retrieveOnly()">查证据</button>
+              <button class="primary-btn" type="button" onclick="sendQuestion()">提交</button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <aside class="insight-rail">
+      <section id="memoryCard" class="memory-card">
+        <h3>案件记忆</h3>
+        <p>暂无案件记忆。</p>
+      </section>
+
+      <section class="source-docket">
+        <h3>证据来源</h3>
+        <div id="referenceList" class="reference-list">
+          <p class="muted">正在检索证据后会显示引用来源。</p>
+        </div>
+      </section>
+
+    </aside>
+  </main>
+
+  <script>
+    let currentCaseId = null;
+    let currentConversationId = null;
+    let currentAnswer = '';
+
+    const $ = (id) => document.getElementById(id);
+
+    function setStatus(text) {
+      $('streamStatus').textContent = text;
+    }
+
+    function cleanTitle(value) {
+      const text = (value || '').trim();
+      return text.length > 22 ? `${text.slice(0, 22)}...` : (text || '未命名案卷');
+    }
+
+    function renderMarkdown(text) {
+      return String(text || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/\n/g, '<br>');
+    }
+
+    function prepareConversation() {
+      if (!currentCaseId) currentCaseId = 'default-case';
+      return { case_id: currentCaseId, conversation_id: currentConversationId };
+    }
+
+    function appendAnswerDelta(text) {
+      currentAnswer += text || '';
+      const target = $('answerStream');
+      target.classList.remove('empty-state');
+      target.innerHTML = renderMarkdown(currentAnswer);
+    }
+
+    function parseSSEStream(buffer, onEvent) {
+      const parts = buffer.split('\n\n');
+      const rest = parts.pop() || '';
+      for (const part of parts) {
+        const eventLine = part.split('\n').find((line) => line.startsWith('event: '));
+        const dataLine = part.split('\n').find((line) => line.startsWith('data: '));
+        if (!eventLine || !dataLine) continue;
+        onEvent(eventLine.slice(7), JSON.parse(dataLine.slice(6)));
+      }
+      return rest;
+    }
+
+    function handleStreamEvent(event, payload) {
+      if (event === 'meta') {
+        currentCaseId = payload.case_id || currentCaseId;
+        currentConversationId = payload.conversation_id || currentConversationId;
+        setStatus(payload.confidence ? `处理中 · ${payload.confidence}` : '处理中');
+      }
+      if (event === 'delta') appendAnswerDelta(payload.text || '');
+      if (event === 'references') renderReferences(payload.references || []);
+      if (event === 'memory') renderMemory(payload.memory || {});
+      if (event === 'steps') setStatus('整理引用');
+      if (event === 'done') setStatus('已完成');
+      if (event === 'error') setStatus(payload.message || '请求失败');
+    }
+
+    async function sendQuestion() {
+      const question = $('questionInput').value.trim();
+      if (!question) return;
+      currentAnswer = '';
+      $('answerStream').textContent = '';
+      setStatus('正在检索证据');
+      prepareConversation();
+
+      const response = await fetch('/chat/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, case_id: currentCaseId, conversation_id: currentConversationId })
+      });
+
+      if (!response.body) {
+        await sendQuestionFallback(question);
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        buffer = parseSSEStream(buffer, handleStreamEvent);
+      }
+    }
+
+    async function sendQuestionFallback(question) {
+      const response = await fetch('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, case_id: currentCaseId, conversation_id: currentConversationId })
+      });
+      const result = await response.json();
+      currentAnswer = result.answer || '';
+      appendAnswerDelta('');
+      renderReferences(result.references || []);
+      renderMemory(result.memory || {});
+      setStatus('已完成');
+    }
+
+    async function retrieveOnly() {
+      const question = $('questionInput').value.trim();
+      if (!question) return;
+      setStatus('正在检索证据');
+      const response = await fetch('/retrieve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, top_k: 5 })
+      });
+      const data = await response.json();
+      renderReferences(data.results || []);
+      setStatus('检索完成');
+    }
+
+    function renderReferences(items) {
+      const list = $('referenceList');
+      if (!items.length) {
+        list.innerHTML = '<p class="muted">暂无证据来源。</p>';
+        return;
+      }
+      list.innerHTML = items.map((item, index) => `
+        <article class="reference-card">
+          <h4>来源 ${index + 1}</h4>
+          <p>${renderMarkdown(item.content || '')}</p>
+          <div class="meta-grid">
+            <span>${renderMarkdown(item.accusations || '罪名未知')}</span>
+            <span>刑期 ${item.punishment || 0} 月</span>
+          </div>
+        </article>
+      `).join('');
+    }
+
+    function renderMemory(memory) {
+      $('memoryCard').innerHTML = `
+        <h3>案件记忆</h3>
+        <p>${renderMarkdown(memory.facts_summary || '暂无案件记忆。')}</p>
+      `;
+    }
+
+    async function createCase() {
+      const title = cleanTitle($('questionInput').value || '未命名案卷');
+      const response = await fetch('/cases', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, case_no: '', case_type: '法律咨询' })
+      });
+      const item = await response.json();
+      currentCaseId = item.id;
+      loadCases();
+    }
+
+    async function deleteCase() {
+      if (!currentCaseId) return;
+      await fetch(`/cases/${currentCaseId}`, { method: 'DELETE' });
+      currentCaseId = null;
+      currentConversationId = null;
+      $('conversationLabel').textContent = '未命名案卷';
+      loadCases();
+    }
+
+    async function loadCases() {
+      const response = await fetch('/cases');
+      const cases = response.ok ? await response.json() : [];
+      const list = $('caseList');
+      list.innerHTML = cases.map((item) => `
+        <button type="button" class="case-item ${item.id === currentCaseId ? 'active' : ''}" data-case-id="${item.id}" data-case-title="${renderMarkdown(cleanTitle(item.title))}">
+          <span class="case-title">${renderMarkdown(cleanTitle(item.title))}</span>
+          <span class="case-sub">${renderMarkdown(item.case_type || '法律咨询')}</span>
+        </button>
+      `).join('') || '<p class="muted">暂无案件。</p>';
+
+      list.querySelectorAll('.case-item').forEach((button) => {
+        button.addEventListener('click', () => selectCase(button.dataset.caseId, button.dataset.caseTitle));
+      });
+    }
+
+    function selectCase(id, title) {
+      currentCaseId = id;
+      $('conversationLabel').textContent = cleanTitle(title);
+      loadMemory(id);
+      loadCases();
+    }
+
+    async function loadMemory(caseId) {
+      const response = await fetch(`/cases/${caseId}/memory`);
+      if (response.ok) renderMemory(await response.json());
+    }
+
+    loadCases();
+  </script>
+</body>
+</html>

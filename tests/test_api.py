@@ -93,10 +93,21 @@ def test_chat_stream_endpoint_emits_sse_events():
         body = response.read().decode("utf-8")
 
     assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["x-accel-buffering"] == "no"
     assert "event: meta" in body
     assert "event: delta" in body
     assert "event: references" in body
+    assert "event: memory" in body
+    assert "event: steps" in body
     assert "event: done" in body
+    events = [
+        line.removeprefix("event: ")
+        for line in body.splitlines()
+        if line.startswith("event: ")
+    ]
+    assert events[:6] == ["meta", "delta", "references", "memory", "steps", "done"]
     payloads = [
         json.loads(line.removeprefix("data: "))
         for line in body.splitlines()
@@ -200,11 +211,15 @@ def test_docs_serves_clean_legal_workbench_interface():
     response = client.get("/docs")
 
     assert response.status_code == 200
-    assert "法律案例 RAG 检索问答系统" in response.text
-    assert "legal-shell" in response.text
-    assert "case-sidebar" in response.text
-    assert "conversation-panel" in response.text
-    assert "evidence-panel" in response.text
+    assert "法律事务台" in response.text
+    assert "lawdesk-app" in response.text
+    assert "dossier-rail" in response.text
+    assert "workbench-main" in response.text
+    assert "insight-rail" in response.text
+    assert "legal-shell" not in response.text
+    assert "case-sidebar" not in response.text
+    assert "conversation-panel" not in response.text
+    assert "evidence-panel" not in response.text
     assert "id=\"questionInput\"" in response.text
     assert "id=\"caseList\"" in response.text
     assert "id=\"memoryCard\"" in response.text
@@ -213,7 +228,9 @@ def test_docs_serves_clean_legal_workbench_interface():
     assert "等待分析。回答将优先" not in response.text
     assert "案件记忆" in response.text
     assert "证据来源" in response.text
-    assert "数据仅在授权环境中处理" in response.text
+    assert "数据仅在授权环境中处理" not in response.text
+    assert "服务状态" not in response.text
+    assert "RAG Workbench" not in response.text
     assert "fetch('/chat'" in response.text
     assert "fetch('/chat/stream'" in response.text
     assert "fetch('/cases'" in response.text
@@ -230,6 +247,29 @@ def test_docs_serves_clean_legal_workbench_interface():
     assert "Swagger</a>" not in response.text
     assert "推理步骤" not in response.text
     assert "<script>" not in response.text.replace("<script>", "", 1)
+
+
+def test_docs_serves_refactored_streaming_workbench_shell():
+    client = TestClient(create_app(agent=FakeAgent()))
+
+    response = client.get("/docs")
+
+    assert response.status_code == 200
+    assert "法律事务台" in response.text
+    assert "dossier-rail" in response.text
+    assert "case-timeline" in response.text
+    assert "source-docket" in response.text
+    assert "matter-ledger" not in response.text
+    assert "evidence-drawer" not in response.text
+    assert "RAG Workbench" not in response.text
+    assert "workspace-layout" not in response.text
+    assert "streamStatus" in response.text
+    assert "answerStream" in response.text
+    assert "function parseSSEStream" in response.text
+    assert "function appendAnswerDelta" in response.text
+    assert "fetch('/chat/stream'" in response.text
+    assert "case_id: currentCaseId" in response.text
+    assert "conversation_id: currentConversationId" in response.text
 
 
 def test_swagger_remains_available_for_api_debugging():
